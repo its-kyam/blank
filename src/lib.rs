@@ -2,11 +2,13 @@
 //! This is blank,
 //! The ultimate web framework
 
-mod tests;
+// use compile-only on tests.rs
 mod constants;
+#[cfg(test)]
+mod tests;
 
 use constants::HELLO_MESSAGE;
 
-pub fn hello_blank() -> &str {
+pub fn hello_blank() -> &'static str {
     HELLO_MESSAGE
 }
