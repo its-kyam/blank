@@ -1,18 +1,6 @@
 // lib.rs
 //! This is blank,
 //! The ultimate web framework
-//!
-//! Code example:
-//! ```rust
-//! use blank::{hello_blank, Blank};
-//!
-//! fn main() {
-//!     println!("{}", hello_blank());
-//!
-//!     // make two servers
-//!     let my_server = Blank::from(1300);
-//!     let my_server2 = Blank::new();
-//! }
 //! ```
 
 // mod all files
