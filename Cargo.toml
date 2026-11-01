@@ -4,3 +4,18 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+
+# Production build configuration
+[profile.release]
+opt-level = 3
+debug = false
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# Test build configuration
+[profile.dev]
+opt-level = 0
+debug = true
+incremental = true
+codegen-units = 256
