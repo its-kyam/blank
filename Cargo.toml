@@ -1,5 +1,7 @@
 [package]
-name = "blank"
+name = "blank-web"
+description = "A lightning-fast web framework where DX is as important as UX, Self implemented Co-Routines"
+repository = "https://github.com/its-kyam/blank"
 version = "0.1.0"
 edition = "2024"
 
