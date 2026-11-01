@@ -139,5 +139,5 @@ mod tests {
     use crate::server_tests;
 
     // Use
-    server_tests!(9022, "Why bro....", 300,);
+    server_tests!(9022, "COOL STUFF!", 300,);
 }
