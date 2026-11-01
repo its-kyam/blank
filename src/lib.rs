@@ -7,7 +7,7 @@
 //! use blank::{hello_blank, Blank};
 //!
 //! fn main() {
-//!     println!(hello_blank());
+//!     println!("{}", hello_blank());
 //!
 //!     // make two servers
 //!     let my_server = Blank::from(1300);
