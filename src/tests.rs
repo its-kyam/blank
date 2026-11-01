@@ -23,21 +23,26 @@ fn hello_test() {
 macro_rules! server_tests {
     (
         // for Blank::from test
-        $some_random_port:expr
+        $some_random_port:expr,
+
+        // for Blank::serve
+        $some_random_return_string:expr,
     ) => {
         // imports
 
         // use super for crate imports as well
         use super::Blank;
-        use super::DEFAULT_PORT;
+        use super::{DEFAULT_PORT, LOCALHOST};
 
+        /// Tests whether all Constructors of Blank are working
         #[test]
         fn blank_constructor_test() {
             // test constructor new
             assert_eq!(
                 Blank::new(),
                 Blank {
-                    tcp_port: DEFAULT_PORT
+                    tcp_port: DEFAULT_PORT,
+                    host: LOCALHOST.to_string(),
                 }
             );
 
@@ -45,7 +50,8 @@ macro_rules! server_tests {
             assert_eq!(
                 Blank::from($some_random_port),
                 Blank {
-                    tcp_port: $some_random_port
+                    tcp_port: $some_random_port,
+                    host: LOCALHOST.to_string(),
                 }
             );
 
@@ -53,6 +59,17 @@ macro_rules! server_tests {
             // should be same as new()
             // new() is already tested
             assert_eq!(Blank::default(), Blank::new());
+        }
+
+        #[test]
+        /// Tests whether serve() function is working
+        fn server_test() {
+            // Simple test
+            // Later we will request endpoints
+            assert_eq!(
+                Blank::from($some_random_port).serve($some_random_return_string),
+                Ok(())
+            )
         }
     };
 }
