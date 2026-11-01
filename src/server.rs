@@ -139,10 +139,5 @@ mod tests {
     use crate::server_tests;
 
     // Use
-    server_tests!(
-        // use a random port number
-        9022,
-        // use a random return string
-        "Why bro....",
-    );
+    server_tests!(9022, "Why bro....", 300,);
 }
