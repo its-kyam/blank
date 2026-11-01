@@ -1,0 +1,91 @@
+
+name: Continuous integration
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  # 1. Quick checks for code formatting or linting
+  code-quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.4.0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+
+      - name: Format Check
+        run: cargo fmt --check
+
+      - name: Linter check
+        # Temporarily allow the two existing warnings.
+        # All other warnings are treated as errors.
+        run: cargo clippy -- -D warnings -A unused_must_use -A clippy::manual_noop_waker
+
+  # 2. Cross-platform testing
+  matrix-test:
+    name: Test Suite
+    needs: code-quality
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4.4.0
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          # Differentiates cache keys by OS since binaries aren't cross-compatible.
+          key: ${{ matrix.os }}
+
+      - name: Build
+        run: cargo build --verbose
+
+      - name: Run Tests
+        run: cargo test --verbose
+
+  # 3. Security audit for vulnerable crate dependencies
+  security-audit:
+    name: Dependency Advisory Audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4.4.0
+
+      - name: Scan for Vulnerabilities
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
