@@ -1,15 +1,19 @@
 // server.rs
-//! Manages Blank objects
+//! This file manages Blank objects
+//!
 //! Blank objects are basically servers.
 //!
 //! Implements all related traits and methods as well.
 //! Blank can be used to create a server, bind
 //! it to a TCP port, and listen to it for requests
+//!
+//! Also uses a macro from tests.rs to run tests that need
+//! access to Blank private fields
 
 // Constants
 use crate::constants::DEFAULT_PORT;
 
-/// A Alias of a u16 that is to make Ports
+/// An Alias of an u16 that is to make Ports
 /// Port is basically a TCP port
 pub type Port = u16;
 
@@ -36,8 +40,8 @@ impl Blank {
 impl From<Port> for Blank {
     /// returns a new Blank with specified TCP port
     ///
-    /// port is a u16
-    // alredy public
+    /// port is an u16
+    // already public
     fn from(port: Port) -> Self {
         Self { tcp_port: port }
     }
@@ -57,12 +61,7 @@ mod tests {
     // import the macro test
     use crate::server_tests;
 
-    // test stuff
-    use super::Blank;
-
-    // constants used
-    use crate::constants::DEFAULT_PORT;
-
+    // Use
     server_tests!(
         // use a random port number
         9022

@@ -8,7 +8,7 @@
 //!     - hello_test
 //!     - blank_constructor_test (as a macro)
 
-use crate::constants::{DEFAULT_PORT, HELLO_MESSAGE};
+use crate::constants::HELLO_MESSAGE;
 use crate::hello_blank;
 
 #[test]
@@ -25,17 +25,33 @@ macro_rules! server_tests {
         // for Blank::from test
         $some_random_port:expr
     ) => {
+        // imports
+
+        // use super for crate imports as well
+        use super::Blank;
+        use super::DEFAULT_PORT;
+
         #[test]
         fn blank_constructor_test() {
             // test constructor new
-            assert_eq!(Blank::new(), Blank { tcp_port: DEFAULT_PORT });
+            assert_eq!(
+                Blank::new(),
+                Blank {
+                    tcp_port: DEFAULT_PORT
+                }
+            );
 
             // test constructor from
-            assert_eq!(Blank::from($some_random_port), Blank { tcp_port: $some_random_port });
+            assert_eq!(
+                Blank::from($some_random_port),
+                Blank {
+                    tcp_port: $some_random_port
+                }
+            );
 
             // test constructor default
             // should be same as new()
-            // new() is alredy tested
+            // new() is already tested
             assert_eq!(Blank::default(), Blank::new());
         }
     };
