@@ -245,11 +245,16 @@ macro_rules! server_tests {
         fn server_bind_failure_test() {
             let port = $some_random_port + 11;
 
-            // Occupy the port before starting Blank.
-            let _occupied_listener = TcpListener::bind(format!("{}:{}", LOCALHOST, port)).unwrap();
+            // Occupy the IPv4 address before starting Blank.
+            let _occupied_listener =
+                TcpListener::bind(format!("127.0.0.1:{}", port)).unwrap();
 
-            // Blank should fail to bind to the occupied port.
-            assert_eq!(Blank::from(port).serve(), Err(ERROR_BIND_SERVER));
+            // Configure Blank to use the exact same address.
+            let mut server = Blank::from(port);
+            server.host = "127.0.0.1".to_string();
+
+            // Blank should fail to bind to the occupied address.
+            assert_eq!(server.serve(), Err(ERROR_BIND_SERVER));
         }
 
         // Tests whether the server can successfully handle
