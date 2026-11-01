@@ -246,8 +246,7 @@ macro_rules! server_tests {
             let port = $some_random_port + 11;
 
             // Occupy the IPv4 address before starting Blank.
-            let _occupied_listener =
-                TcpListener::bind(format!("127.0.0.1:{}", port)).unwrap();
+            let _occupied_listener = TcpListener::bind(format!("127.0.0.1:{}", port)).unwrap();
 
             // Configure Blank to use the exact same address.
             let mut server = Blank::from(port);
