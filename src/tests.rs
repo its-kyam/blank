@@ -8,6 +8,7 @@
 //!     - hello_test
 //!     - blank_constructor_test (as a macro)
 
+// crate imports
 use crate::constants::HELLO_MESSAGE;
 use crate::hello_blank;
 
@@ -27,10 +28,17 @@ macro_rules! server_tests {
 
         // for Blank::serve
         $some_random_return_string:expr,
+
+        // for Blank::serve
+        $some_random_deadline:expr,
     ) => {
         // imports
+        use std::io::{Read, Write};
+        use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+        use std::thread;
+        use std::time::Duration;
 
-        // use super for crate imports as well
+        // use super for crate imports
         use super::Blank;
         use super::{DEFAULT_PORT, LOCALHOST};
 
@@ -64,12 +72,53 @@ macro_rules! server_tests {
         #[test]
         /// Tests whether serve() function is working
         fn server_test() {
-            // Simple test
-            // Later we will request endpoints
-            assert_eq!(
-                Blank::from($some_random_port).serve($some_random_return_string),
-                Ok(())
+            let server = Blank::from($some_random_port);
+
+            // save the host
+            let host = server.host.clone();
+
+            let return_stuff = $some_random_return_string;
+
+            // Start server in a separate thread
+            // We can use unwrap here as panics are what
+            // are supposed to happen
+            let _server_func = thread::spawn(move || {
+                server.serve(return_stuff).unwrap();
+            });
+
+            // Wait for server to become available
+
+            // address
+            // use format for this
+            let addr: SocketAddr = format!("{}:{}", host, $some_random_port)
+                .to_socket_addrs()
+                .unwrap()
+                .next()
+                .unwrap();
+
+            // make a client object that can be used to request the server
+            let mut client = TcpStream::connect_timeout(
+                &addr,
+                // make a deadline of milliseconds
+                Duration::from_millis($some_random_deadline),
             )
+            .unwrap();
+
+            // Request an endpoint and read the response
+            client
+                .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .unwrap();
+
+            // Read the response.
+            let mut res = String::new();
+            client.read_to_string(&mut res).unwrap();
+
+            // stop the server
+            client.shutdown(std::net::Shutdown::Both).unwrap();
+
+            // Evaluate the response
+            assert!(res.contains("HTTP/1.1 200 OK"));
+            assert!(res.contains(return_stuff));
         }
     };
 }
