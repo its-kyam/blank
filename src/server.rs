@@ -15,6 +15,9 @@ pub type Port = u16;
 
 /// The core of blank, a web server
 /// that listens on a TCP port
+// use a cfg_attr so that our unit tests
+// can use tcp_port
+#[cfg_attr(test, derive(Debug, PartialEq))]
 pub struct Blank {
     /// TCP Port on which the server listens on
     tcp_port: Port,
@@ -46,4 +49,22 @@ impl Default for Blank {
         // return what new() returns
         Self::new()
     }
+}
+
+// the tests
+#[cfg(test)]
+mod tests {
+    // import the macro test
+    use crate::server_tests;
+
+    // test stuff
+    use super::Blank;
+
+    // constants used
+    use crate::constants::DEFAULT_PORT;
+
+    server_tests!(
+        // use a random port number
+        9022
+    );
 }
