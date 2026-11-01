@@ -26,7 +26,7 @@ mod server;
 mod tests;
 
 // make module contents publicly available
-pub use server::{Blank, BlankReq, BlankHeaders, BlankView};
+pub use server::{Blank, BlankHeaders, BlankReq, BlankView};
 
 use constants::HELLO_MESSAGE;
 
