@@ -2,6 +2,8 @@
 name = "blank-web"
 description = "A lightning-fast web framework where DX is as important as UX, Self implemented Co-Routines"
 repository = "https://github.com/its-kyam/blank"
+license = "MIT OR Apache-2.0"
+authors = ["Kushaal Bandi <koolcoolkoolcoolkoolkool@gmail.com"]
 version = "0.1.0"
 edition = "2024"
 
