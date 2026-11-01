@@ -6,6 +6,8 @@
 //!
 //! ```rust
 //! use blank_web::{Blank, BlankRes};
+//! use std::time::Duration;
+//! use std::thread::sleep;
 //!
 //! fn main() -> () {
 //!     let mut server = Blank::new();
@@ -18,7 +20,10 @@
 //!         out.redirect("/home");
 //!    });
 //!
-//!     server.serve().unwrap();
+//!     let working = server.serve_async();
+//!
+//!     sleep(Duration::from_millis(5000));
+//!     working.unwrap().async_stop();
 //!  }
 //! ```
 

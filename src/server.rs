@@ -7,33 +7,45 @@
 //! Blank can be used to create a server, register routes,
 //! bind it to a TCP port, and listen for requests.
 //!
-//! The runtime uses Rust futures and a small cooperative
-//! executor. It has no external dependencies.
+//! The server uses blocking OS socket readiness and bounded
+//! connection workers. It does not repeatedly poll idle sockets.
 
 // Constants
 use crate::constants::{
-    BlankError, CONTENT_TYPE_HTML, CONTENT_TYPE_JSON, CONTENT_TYPE_OCTET_STREAM, CONTENT_TYPE_TEXT,
-    DEFAULT_PORT, ERROR_ACCEPT_CONNECTION, ERROR_BIND_SERVER, ERROR_SET_NONBLOCKING,
-    HTTP_BAD_GATEWAY, HTTP_BAD_REQUEST, HTTP_BUFFER, HTTP_CREATED, HTTP_FORBIDDEN, HTTP_FOUND,
+    BODY_BAD_GATEWAY, BODY_BAD_REQUEST, BODY_CONTENT_TOO_LARGE, BODY_FORBIDDEN,
+    BODY_GATEWAY_TIMEOUT, BODY_HTTP_VERSION_NOT_SUPPORTED, BODY_INTERNAL_SERVER_ERROR,
+    BODY_METHOD_NOT_ALLOWED, BODY_NOT_FOUND, BODY_NOT_IMPLEMENTED, BODY_REQUEST_ERROR,
+    BODY_REQUEST_HEADERS_TOO_LARGE, BODY_REQUEST_TIMEOUT, BODY_SERVICE_UNAVAILABLE,
+    BODY_TOO_MANY_REQUESTS, BODY_TRANSFER_ENCODING_NOT_SUPPORTED, BODY_UNAUTHORIZED, BlankError,
+    CLIENT_THREAD_NAME, CONTENT_TYPE_FORM_URLENCODED, CONTENT_TYPE_HTML, CONTENT_TYPE_JSON,
+    CONTENT_TYPE_MULTIPART_FORM_DATA, CONTENT_TYPE_OCTET_STREAM, CONTENT_TYPE_TEXT,
+    COOKIE_CLEAR_ATTRIBUTES, COOKIE_DEFAULT_ATTRIBUTES, DEFAULT_PORT, ERROR_ACCEPT_CONNECTION,
+    ERROR_BIND_SERVER, ERROR_SERVER_THREAD_PANIC, ERROR_SPAWN_SERVER_THREAD, HTTP_BAD_GATEWAY,
+    HTTP_BAD_REQUEST, HTTP_BUFFER, HTTP_CONNECTION_CLOSE, HTTP_CONTENT_DISPOSITION_HEADER,
+    HTTP_CONTENT_LENGTH_HEADER, HTTP_CONTENT_TYPE_HEADER, HTTP_CREATED, HTTP_FORBIDDEN, HTTP_FOUND,
     HTTP_GATEWAY_TIMEOUT, HTTP_HEADER_END, HTTP_HEADER_FIELDS_TOO_LARGE,
-    HTTP_INTERNAL_SERVER_ERROR, HTTP_METHOD_NOT_ALLOWED, HTTP_MOVED_PERMANENTLY, HTTP_NO_CONTENT,
-    HTTP_NOT_FOUND, HTTP_NOT_IMPLEMENTED, HTTP_OK, HTTP_PAYLOAD_TOO_LARGE, HTTP_REQUEST_TIMEOUT,
-    HTTP_REQUEST_TIMEOUT_MS, HTTP_SERVICE_UNAVAILABLE, HTTP_TOO_MANY_REQUESTS, HTTP_UNAUTHORIZED,
-    HTTP_VERSION_NOT_SUPPORTED, HTTP_WRITE_TIMEOUT_MS, LOCALHOST, MAX_ACCEPTS_PER_TICK,
-    MAX_ACTIVE_CONNECTIONS, MAX_HTTP_HEADER_SIZE, REAL_HTTP_METHODS, RUNTIME_POLL_INTERVAL_MS,
+    HTTP_INTERNAL_SERVER_ERROR, HTTP_LINE_END, HTTP_METHOD_GET, HTTP_METHOD_NOT_ALLOWED,
+    HTTP_METHOD_POST, HTTP_MOVED_PERMANENTLY, HTTP_NO_CONTENT, HTTP_NOT_FOUND,
+    HTTP_NOT_IMPLEMENTED, HTTP_OK, HTTP_PAYLOAD_TOO_LARGE, HTTP_REQUEST_TIMEOUT,
+    HTTP_REQUEST_TIMEOUT_MS, HTTP_RESPONSE_CONNECTION, HTTP_RESPONSE_CONTENT_LENGTH,
+    HTTP_RESPONSE_CONTENT_TYPE, HTTP_RESPONSE_LOCATION, HTTP_RESPONSE_SET_COOKIE,
+    HTTP_RESPONSE_VERSION, HTTP_SERVICE_UNAVAILABLE, HTTP_TOO_MANY_REQUESTS,
+    HTTP_TRANSFER_ENCODING_HEADER, HTTP_UNAUTHORIZED, HTTP_VERSION_NOT_SUPPORTED,
+    HTTP_WRITE_TIMEOUT_MS, LOCALHOST, MAX_ACTIVE_CONNECTIONS, MAX_FORM_FIELD_SIZE, MAX_FORM_FIELDS,
+    MAX_HTTP_BODY_SIZE, MAX_HTTP_HEADER_SIZE, MULTIPART_BOUNDARY_PARAMETER,
+    MULTIPART_BOUNDARY_PREFIX, MULTIPART_FILENAME_PARAMETER, MULTIPART_FINAL_MARKER,
+    MULTIPART_NAME_PARAMETER, REAL_HTTP_METHODS, SERVER_THREAD_NAME, SERVER_WAKE_TIMEOUT_MS,
     SUPPORTED_HTTP_METHODS, SUPPORTED_HTTP_VERSIONS,
 };
 
 // Imports
 use std::collections::HashMap;
-use std::future::Future;
 use std::io::{self, Read, Write};
-use std::marker::PhantomData;
-use std::net::{TcpListener, TcpStream};
-use std::pin::Pin;
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::ops::Deref;
 use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
-use std::thread;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 /// An Alias of an u16 that is to make Ports.
@@ -44,14 +56,151 @@ pub type Port = u16;
 pub type Host = String;
 
 /// An alias for request headers.
-///
-/// A real `BlankReq` struct will replace this alias later.
-/// Header names are stored in lowercase and repeated headers
-/// are stored as multiple values in the same vector.
-pub type BlankReq = HashMap<String, Vec<String>>;
-
-/// An alias for response headers.
 pub type BlankHeaders = HashMap<String, Vec<String>>;
+
+/// An alias for parsed query-string values.
+pub type BlankQuery = HashMap<String, Vec<String>>;
+
+/// An alias for parsed HTML form values.
+pub type BlankForms = HashMap<String, Vec<String>>;
+
+/// A parsed HTTP request available to every Blank view.
+///
+/// Header names are stored in lowercase. Repeated headers, query
+/// parameters, and form fields are stored as multiple values.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlankReq {
+    /// HTTP method, such as GET or POST.
+    method: String,
+
+    /// Request path without its query string.
+    route: String,
+
+    /// HTTP version used by the client.
+    version: String,
+
+    /// All request headers.
+    headers: BlankHeaders,
+
+    /// Raw request body.
+    body: Vec<u8>,
+
+    /// Parsed URL query parameters.
+    query: BlankQuery,
+
+    /// Parsed URL-encoded or multipart form fields.
+    forms: BlankForms,
+}
+
+impl Deref for BlankReq {
+    type Target = BlankHeaders;
+
+    fn deref(&self) -> &Self::Target {
+        &self.headers
+    }
+}
+
+impl BlankReq {
+    /// Returns the HTTP method.
+    pub fn method(&self) -> &str {
+        &self.method
+    }
+
+    /// Returns the request path without its query string.
+    pub fn route(&self) -> &str {
+        &self.route
+    }
+
+    /// Returns the HTTP version.
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    /// Returns every request header.
+    pub fn headers(&self) -> &BlankHeaders {
+        &self.headers
+    }
+
+    /// Returns the first value for a request header.
+    ///
+    /// Header names are case-insensitive.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .get(&name.to_ascii_lowercase())
+            .and_then(|values| values.first())
+            .map(String::as_str)
+    }
+
+    /// Returns every value for a request header.
+    ///
+    /// Header names are case-insensitive.
+    pub fn header_values(&self, name: &str) -> Option<&[String]> {
+        self.headers
+            .get(&name.to_ascii_lowercase())
+            .map(Vec::as_slice)
+    }
+
+    /// Returns the raw request body.
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
+
+    /// Returns the request body as UTF-8 text.
+    pub fn body_text(&self) -> Result<&str, std::str::Utf8Error> {
+        std::str::from_utf8(&self.body)
+    }
+
+    /// Returns the request content type, if one was supplied.
+    pub fn content_type(&self) -> Option<&str> {
+        self.header(HTTP_CONTENT_TYPE_HEADER)
+    }
+
+    /// Returns every parsed query parameter.
+    pub fn query(&self) -> &BlankQuery {
+        &self.query
+    }
+
+    /// Returns the first value for a query parameter.
+    pub fn query_value(&self, name: &str) -> Option<&str> {
+        self.query
+            .get(name)
+            .and_then(|values| values.first())
+            .map(String::as_str)
+    }
+
+    /// Returns every value for a query parameter.
+    pub fn query_values(&self, name: &str) -> Option<&[String]> {
+        self.query.get(name).map(Vec::as_slice)
+    }
+
+    /// Returns every parsed form field.
+    pub fn forms(&self) -> &BlankForms {
+        &self.forms
+    }
+
+    /// Returns the first value for a form field.
+    pub fn form(&self, name: &str) -> Option<&str> {
+        self.forms
+            .get(name)
+            .and_then(|values| values.first())
+            .map(String::as_str)
+    }
+
+    /// Returns every value for a form field.
+    pub fn form_values(&self, name: &str) -> Option<&[String]> {
+        self.forms.get(name).map(Vec::as_slice)
+    }
+
+    /// Returns true when this request uses the POST method.
+    pub fn is_post(&self) -> bool {
+        self.method == HTTP_METHOD_POST
+    }
+
+    /// Returns true when this request uses the GET method.
+    pub fn is_get(&self) -> bool {
+        self.method == HTTP_METHOD_GET
+    }
+}
 
 /// An alias of a Blank view function.
 ///
@@ -205,39 +354,39 @@ impl BlankRes {
 
     /// Sets a 400 Bad Request response.
     pub fn bad_request(&mut self) -> &mut Self {
-        self.status(HTTP_BAD_REQUEST).text("Bad Request")
+        self.status(HTTP_BAD_REQUEST).text(BODY_BAD_REQUEST)
     }
 
     /// Sets a 401 Unauthorized response.
     pub fn unauthorized(&mut self) -> &mut Self {
-        self.status(HTTP_UNAUTHORIZED).text("Unauthorized")
+        self.status(HTTP_UNAUTHORIZED).text(BODY_UNAUTHORIZED)
     }
 
     /// Sets a 403 Forbidden response.
     pub fn forbidden(&mut self) -> &mut Self {
-        self.status(HTTP_FORBIDDEN).text("Forbidden")
+        self.status(HTTP_FORBIDDEN).text(BODY_FORBIDDEN)
     }
 
     /// Sets a 404 Not Found response.
     pub fn not_found(&mut self) -> &mut Self {
-        self.status(HTTP_NOT_FOUND).text("Not Found")
+        self.status(HTTP_NOT_FOUND).text(BODY_NOT_FOUND)
     }
 
     /// Sets a 405 Method Not Allowed response.
     pub fn method_not_allowed(&mut self) -> &mut Self {
         self.status(HTTP_METHOD_NOT_ALLOWED)
-            .text("Method Not Allowed")
+            .text(BODY_METHOD_NOT_ALLOWED)
     }
 
     /// Sets a 408 Request Timeout response.
     pub fn request_timeout(&mut self) -> &mut Self {
-        self.status(HTTP_REQUEST_TIMEOUT).text("Request Timeout")
+        self.status(HTTP_REQUEST_TIMEOUT).text(BODY_REQUEST_TIMEOUT)
     }
 
     /// Sets a 500 Internal Server Error response.
     pub fn internal_server_error(&mut self) -> &mut Self {
         self.status(HTTP_INTERNAL_SERVER_ERROR)
-            .text("Internal Server Error")
+            .text(BODY_INTERNAL_SERVER_ERROR)
     }
 
     /// Sets a 301 Moved Permanently response and its location.
@@ -249,36 +398,36 @@ impl BlankRes {
         }
 
         self.status(HTTP_MOVED_PERMANENTLY)
-            .set_header("Location", location)
+            .set_header(HTTP_RESPONSE_LOCATION, location)
             .text("")
     }
 
     /// Sets a 413 Content Too Large response.
     pub fn payload_too_large(&mut self) -> &mut Self {
         self.status(HTTP_PAYLOAD_TOO_LARGE)
-            .text("Content Too Large")
+            .text(BODY_CONTENT_TOO_LARGE)
     }
 
     /// Sets a 429 Too Many Requests response.
     pub fn too_many_requests(&mut self) -> &mut Self {
         self.status(HTTP_TOO_MANY_REQUESTS)
-            .text("Too Many Requests")
+            .text(BODY_TOO_MANY_REQUESTS)
     }
 
     /// Sets a 502 Bad Gateway response.
     pub fn bad_gateway(&mut self) -> &mut Self {
-        self.status(HTTP_BAD_GATEWAY).text("Bad Gateway")
+        self.status(HTTP_BAD_GATEWAY).text(BODY_BAD_GATEWAY)
     }
 
     /// Sets a 504 Gateway Timeout response.
     pub fn gateway_timeout(&mut self) -> &mut Self {
-        self.status(HTTP_GATEWAY_TIMEOUT).text("Gateway Timeout")
+        self.status(HTTP_GATEWAY_TIMEOUT).text(BODY_GATEWAY_TIMEOUT)
     }
 
     /// Sets a 503 Service Unavailable response.
     pub fn service_unavailable(&mut self) -> &mut Self {
         self.status(HTTP_SERVICE_UNAVAILABLE)
-            .text("Service Unavailable")
+            .text(BODY_SERVICE_UNAVAILABLE)
     }
 
     /// Overrides the response content type.
@@ -328,7 +477,6 @@ impl BlankRes {
         }
 
         self.headers.insert(name.to_ascii_lowercase(), vec![value]);
-
         self
     }
 
@@ -359,8 +507,8 @@ impl BlankRes {
         }
 
         self.header(
-            "Set-Cookie",
-            format!("{}={}; Path=/; HttpOnly; SameSite=Lax", name, value),
+            HTTP_RESPONSE_SET_COOKIE,
+            format!("{}={}; {}", name, value, COOKIE_DEFAULT_ATTRIBUTES),
         )
     }
 
@@ -373,8 +521,8 @@ impl BlankRes {
         }
 
         self.header(
-            "Set-Cookie",
-            format!("{}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax", name),
+            HTTP_RESPONSE_SET_COOKIE,
+            format!("{}=; {}", name, COOKIE_CLEAR_ATTRIBUTES),
         )
     }
 
@@ -387,7 +535,7 @@ impl BlankRes {
         }
 
         self.status(HTTP_FOUND)
-            .set_header("Location", location)
+            .set_header(HTTP_RESPONSE_LOCATION, location)
             .text("")
     }
 
@@ -457,10 +605,15 @@ macro_rules! http_return {
 
         // Make the response line and standard headers.
         let mut response = format!(
-            "HTTP/1.1 {}\r\nContent-Length: {}\r\nContent-Type: {}\r\nConnection: close\r\n",
+            "{} {}\r\n{}: {}\r\n{}: {}\r\n{}: {}\r\n",
+            HTTP_RESPONSE_VERSION,
             $res_code,
+            HTTP_RESPONSE_CONTENT_LENGTH,
             content.len(),
+            HTTP_RESPONSE_CONTENT_TYPE,
             $content_type,
+            HTTP_RESPONSE_CONNECTION,
+            HTTP_CONNECTION_CLOSE,
         )
         .into_bytes();
 
@@ -472,7 +625,7 @@ macro_rules! http_return {
         }
 
         // Finish the headers and append the response body.
-        response.extend_from_slice(b"\r\n");
+        response.extend_from_slice(HTTP_LINE_END);
         response.extend_from_slice(content);
 
         response
@@ -482,7 +635,7 @@ macro_rules! http_return {
 /// The core of Blank, a web server that listens on a TCP port.
 ///
 /// The route registry is private. Each route points to a view function
-/// that receives a request and fills a response.
+/// that receives a parsed request and fills a response.
 #[cfg_attr(test, derive(Debug, PartialEq))]
 pub struct Blank {
     /// TCP Port on which the server listens on.
@@ -560,102 +713,197 @@ impl Blank {
         self.routes.len()
     }
 
-    /// Function that runs the server on the specified port.
+    /// Runs the server and waits until it stops or encounters an error.
     ///
-    /// The runtime is a small cooperative executor:
-    /// - The listener and client streams are non-blocking.
-    /// - Every client is handled by an async future.
-    /// - Pending futures yield back to the executor.
-    /// - The executor polls active futures without spawning a thread
-    ///   per connection.
+    /// This is the blocking entry point. It uses blocking `accept()` and
+    /// lets the operating system sleep until a connection is ready.
+    pub fn serve_await(&self) -> Result<(), BlankError> {
+        let server = bind_server(&self.host, self.tcp_port)?;
+        run_server(
+            server,
+            Arc::new(self.routes.clone()),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    /// Alias for `serve_await()`.
     ///
-    /// This first standard-library-only executor polls its tasks at a
-    /// fixed interval. It is portable, but a future reactor can replace
-    /// the polling scheduler for better scalability.
+    /// `serve()` intentionally has the same blocking behavior.
     pub fn serve(&self) -> Result<(), BlankError> {
-        // Bind the server to the configured host and port.
-        let server = TcpListener::bind(format!("{}:{}", self.host, self.tcp_port))
-            .map_err(|_| ERROR_BIND_SERVER)?;
+        self.serve_await()
+    }
 
-        // Make the listener non-blocking so accept() never stalls
-        // the entire coroutine scheduler.
-        server
-            .set_nonblocking(true)
-            .map_err(|_| ERROR_SET_NONBLOCKING)?;
-
-        // Keep a stable snapshot of the route registry for all tasks.
+    /// Starts the server on a background operating-system thread.
+    ///
+    /// The returned handle can stop and join that thread with
+    /// `BlankServer::async_stop()`.
+    pub fn serve_async(&self) -> Result<BlankServer, BlankError> {
+        let server = bind_server(&self.host, self.tcp_port)?;
+        let address = server.local_addr().map_err(|_| ERROR_BIND_SERVER)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
         let routes = Arc::new(self.routes.clone());
 
-        // A no-op waker is sufficient because this executor polls
-        // every pending task on each scheduler pass.
-        let waker = Waker::noop();
-        let mut context = Context::from_waker(waker);
+        let handle = thread::Builder::new()
+            .name(SERVER_THREAD_NAME.to_string())
+            .spawn(move || run_server(server, routes, thread_stop))
+            .map_err(|_| ERROR_SPAWN_SERVER_THREAD)?;
 
-        // Every accepted client becomes its own Future.
-        // The Future is a coroutine state machine generated by async fn.
-        let mut tasks: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> = Vec::new();
+        Ok(BlankServer {
+            stop,
+            address,
+            thread: Some(handle),
+        })
+    }
+}
 
-        // Run forever until the listener encounters a fatal error.
-        loop {
-            // Accept connections in bounded batches.
-            // This prevents a continuous stream of new clients from
-            // starving the tasks that are already running.
-            let mut accepted = 0;
+/// A handle to a server started by `Blank::serve_async()`.
+///
+/// Stopping the handle wakes the blocking listener and joins its thread.
+pub struct BlankServer {
+    stop: Arc<AtomicBool>,
+    address: SocketAddr,
+    thread: Option<JoinHandle<Result<(), BlankError>>>,
+}
 
-            loop {
-                if accepted >= MAX_ACCEPTS_PER_TICK {
-                    break;
-                }
+impl BlankServer {
+    /// Returns the actual local address selected by the operating system.
+    ///
+    /// This is especially useful when Blank was configured with port `0`.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.address
+    }
 
-                match server.accept() {
-                    Ok((client, _address)) => {
-                        accepted += 1;
+    /// Stops the background server and waits for its thread to finish.
+    ///
+    /// Active request workers are allowed to finish before the server exits.
+    pub fn async_stop(mut self) -> Result<(), BlankError> {
+        self.stop_and_join()
+    }
 
-                        // Keep the number of active tasks bounded.
-                        // Dropping an accepted stream closes excess connections.
-                        if tasks.len() >= MAX_ACTIVE_CONNECTIONS {
-                            continue;
-                        }
+    /// Signals the listener, wakes its blocking accept call, and joins it.
+    fn stop_and_join(&mut self) -> Result<(), BlankError> {
+        let Some(thread) = self.thread.take() else {
+            return Ok(());
+        };
 
-                        // Every accepted stream must also be non-blocking.
-                        if client.set_nonblocking(true).is_err() {
-                            continue;
-                        }
+        self.stop.store(true, Ordering::Release);
 
-                        // Create a coroutine task for this client.
-                        tasks.push(Box::pin(handle_connection(client, Arc::clone(&routes))));
-                    }
-                    // No more connections are ready right now.
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                    // Retry an interrupted except operation.
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                    // A fatal listener error should be returned to the caller.
-                    Err(_) => return Err(ERROR_ACCEPT_CONNECTION),
-                }
+        // A local connection wakes the listener without polling or sleeping.
+        let wake_address = loopback_address(self.address);
+        let _ = TcpStream::connect_timeout(
+            &wake_address,
+            Duration::from_millis(SERVER_WAKE_TIMEOUT_MS),
+        );
+
+        thread.join().map_err(|_| ERROR_SERVER_THREAD_PANIC)?
+    }
+}
+
+impl Drop for BlankServer {
+    fn drop(&mut self) {
+        // Do not leave a server thread running when its handle is dropped.
+        let _ = self.stop_and_join();
+    }
+}
+
+/// Binds a TCP listener to the configured host and port.
+fn bind_server(host: &str, port: Port) -> Result<TcpListener, BlankError> {
+    TcpListener::bind(format!("{}:{}", host, port)).map_err(|_| ERROR_BIND_SERVER)
+}
+
+/// Converts an unspecified bind address to a loopback address for shutdown.
+fn loopback_address(address: SocketAddr) -> SocketAddr {
+    match address {
+        SocketAddr::V4(address) if address.ip().is_unspecified() => {
+            SocketAddr::from(([127, 0, 0, 1], address.port()))
+        }
+        SocketAddr::V6(address) if address.ip().is_unspecified() => {
+            SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], address.port()))
+        }
+        address => address,
+    }
+}
+
+/// Runs the listener and dispatches accepted clients to bounded workers.
+fn run_server(
+    server: TcpListener,
+    routes: Arc<HashMap<String, BlankView>>,
+    stop: Arc<AtomicBool>,
+) -> Result<(), BlankError> {
+    // Keep worker handles so completed workers can be reaped and shutdown is clean.
+    let mut workers: Vec<JoinHandle<()>> = Vec::new();
+    let mut result = Ok(());
+
+    loop {
+        // The listener blocks here until a client connects or shutdown wakes it.
+        let (client, _address) = match server.accept() {
+            Ok(connection) => connection,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                result = Err(ERROR_ACCEPT_CONNECTION);
+                break;
             }
+        };
 
-            // Poll every active client coroutine once.
-            let mut index = 0;
+        // The wake connection exists only to release accept() during shutdown.
+        if stop.load(Ordering::Acquire) {
+            let _ = client.shutdown(Shutdown::Both);
+            break;
+        }
 
-            while index < tasks.len() {
-                match tasks[index].as_mut().poll(&mut context) {
-                    // The connection has finished; remove its task.
-                    Poll::Ready(()) => {
-                        drop(tasks.swap_remove(index));
-                    }
-                    // The connection needs more socket readiness.
-                    // Leave it in the list for the next scheduler pass.
-                    Poll::Pending => {
-                        index += 1;
-                    }
-                }
-            }
+        // Remove completed workers before checking the connection limit.
+        reap_workers(&mut workers);
 
-            // This is the portable polling interval.
-            // It prevents a busy loop when every socket is waiting.
-            thread::sleep(Duration::from_millis(RUNTIME_POLL_INTERVAL_MS));
+        // Refuse excess connections instead of creating an unbounded number of threads.
+        if workers.len() >= MAX_ACTIVE_CONNECTIONS {
+            write_service_unavailable(client);
+            continue;
+        }
+
+        let routes = Arc::clone(&routes);
+        let worker = thread::Builder::new()
+            .name(CLIENT_THREAD_NAME.to_string())
+            .spawn(move || handle_connection(client, routes));
+
+        match worker {
+            Ok(worker) => workers.push(worker),
+            Err(_) => continue,
         }
     }
+
+    // Finish active requests before returning from the server thread.
+    for worker in workers {
+        let _ = worker.join();
+    }
+
+    result
+}
+/// Joins workers that have already completed.
+fn reap_workers(workers: &mut Vec<JoinHandle<()>>) {
+    let mut index = 0;
+
+    while index < workers.len() {
+        if workers[index].is_finished() {
+            let worker = workers.swap_remove(index);
+            let _ = worker.join();
+        } else {
+            index += 1;
+        }
+    }
+}
+
+/// Writes a small overload response and closes the client connection.
+fn write_service_unavailable(mut client: TcpStream) {
+    let response = http_return!(
+        HTTP_SERVICE_UNAVAILABLE,
+        BODY_SERVICE_UNAVAILABLE.as_bytes(),
+        CONTENT_TYPE_TEXT,
+        &HashMap::<String, Vec<String>>::new()
+    );
+
+    let _ = write_all_timeout(&mut client, &response);
+    let _ = client.shutdown(Shutdown::Both);
 }
 
 /// Normalizes a route to begin with a slash.
@@ -667,167 +915,205 @@ fn normalize_route(route: &str) -> String {
     }
 }
 
-/// A small standard-library replacement for `std::future::poll_fn`.
-///
-/// It lets the socket helpers return Pending when a non-blocking
-/// read or write would block, then resume on the next executor pass.
-struct PollFn<F, T> {
-    function: F,
-
-    // Keep the output type in the future's type so it is constrained
-    // by the Future implementation.
-    _output: PhantomData<fn() -> T>,
+/// Describes why an HTTP request could not be read completely.
+enum RequestReadError {
+    BadRequest,
+    HeaderTooLarge,
+    BodyTooLarge,
+    NotImplemented,
+    TimedOut,
+    Io,
 }
 
-impl<F, T> Future for PollFn<F, T>
-where
-    F: FnMut(&mut Context<'_>) -> Poll<T> + Unpin,
-{
-    type Output = T;
-
-    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        (self.get_mut().function)(context)
+impl RequestReadError {
+    /// Returns the HTTP status and body for this read error.
+    fn response(&self) -> (&'static str, &'static str) {
+        match self {
+            Self::BadRequest => (HTTP_BAD_REQUEST, BODY_BAD_REQUEST),
+            Self::HeaderTooLarge => (HTTP_HEADER_FIELDS_TOO_LARGE, BODY_REQUEST_HEADERS_TOO_LARGE),
+            Self::BodyTooLarge => (HTTP_PAYLOAD_TOO_LARGE, BODY_CONTENT_TOO_LARGE),
+            Self::NotImplemented => (HTTP_NOT_IMPLEMENTED, BODY_TRANSFER_ENCODING_NOT_SUPPORTED),
+            Self::TimedOut => (HTTP_REQUEST_TIMEOUT, BODY_REQUEST_TIMEOUT),
+            Self::Io => (HTTP_BAD_REQUEST, BODY_BAD_REQUEST),
+        }
     }
 }
 
-/// Creates a future from a polling closure.
-fn poll_fn<F, T>(function: F) -> PollFn<F, T>
-where
-    F: FnMut(&mut Context<'_>) -> Poll<T> + Unpin,
-{
-    PollFn {
-        function,
-        _output: PhantomData,
-    }
-}
-
-/// Reads one HTTP header block from a non-blocking client stream.
-async fn read_http_request(client: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
-    // Store all bytes read from the client.
-    let mut request = Vec::new();
-
-    // Reuse the configured HTTP buffer size.
+/// Reads one complete HTTP request from a blocking client stream.
+fn read_http_request(client: &mut TcpStream) -> Result<Option<Vec<u8>>, RequestReadError> {
+    let mut request = Vec::with_capacity(HTTP_BUFFER.len() * 2);
     let mut buffer = HTTP_BUFFER;
-
-    // Prevent a client from keeping a coroutine alive forever
-    // by connecting and never finishing its request headers.
+    let mut headers_complete = false;
+    let mut expected_length: Option<usize> = None;
     let started = Instant::now();
+    let timeout = Duration::from_millis(HTTP_REQUEST_TIMEOUT_MS);
 
     loop {
-        // Try to read. If the socket blocked, yield to the executor.
-        let bytes_read = poll_fn(|_context| {
-            if started.elapsed() >= Duration::from_millis(HTTP_REQUEST_TIMEOUT_MS) {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "HTTP request timed out",
-                )));
-            }
+        // Once the header is known, read no more than the remaining request bytes.
+        let read_limit = match expected_length {
+            Some(length) => length.saturating_sub(request.len()).min(buffer.len()),
+            None => buffer.len(),
+        };
 
-            match client.read(&mut buffer) {
-                Ok(bytes_read) => Poll::Ready(Ok(bytes_read)),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => Poll::Pending,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => Poll::Pending,
-                Err(error) => Poll::Ready(Err(error)),
-            }
-        })
-        .await?;
-
-        // The client closed its write side.
-        if bytes_read == 0 {
-            return if request.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(request))
-            };
-        }
-
-        // Append the newly received bytes.
-        request.extend_from_slice(&buffer[..bytes_read]);
-
-        // Check whether the complete header block has arrived.
-        if let Some(header_end) = request
-            .windows(HTTP_HEADER_END.len())
-            .position(|window| window == HTTP_HEADER_END)
-        {
-            // Only the header block is currently parsed.
-            if header_end > MAX_HTTP_HEADER_SIZE {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "HTTP request headers are too large",
-                ));
-            }
-
+        if read_limit == 0 {
             return Ok(Some(request));
         }
 
-        // Stop clients from sending unlimited incomplete headers.
-        if request.len() > MAX_HTTP_HEADER_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "HTTP request headers are too large",
-            ));
+        // Use one deadline for the whole request, not a fresh timeout per byte.
+        let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+            return Err(RequestReadError::TimedOut);
+        };
+
+        if remaining.is_zero() {
+            return Err(RequestReadError::TimedOut);
+        }
+
+        client
+            .set_read_timeout(Some(remaining))
+            .map_err(|_| RequestReadError::Io)?;
+
+        let bytes_read = match client.read(&mut buffer[..read_limit]) {
+            Ok(0) => {
+                if request.is_empty() {
+                    return Ok(None);
+                }
+
+                return Err(RequestReadError::BadRequest);
+            }
+            Ok(bytes_read) => bytes_read,
+            Err(error)
+                if error.kind() == io::ErrorKind::TimedOut
+                    || error.kind() == io::ErrorKind::WouldBlock =>
+            {
+                return Err(RequestReadError::TimedOut);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return Err(RequestReadError::Io),
+        };
+
+        request.extend_from_slice(&buffer[..bytes_read]);
+
+        // Locate and validate the header block once it has arrived.
+        if !headers_complete {
+            if let Some(end) = find_bytes(&request, HTTP_HEADER_END) {
+                if end > MAX_HTTP_HEADER_SIZE {
+                    return Err(RequestReadError::HeaderTooLarge);
+                }
+
+                let header = &request[..end];
+                let (content_length, has_transfer_encoding) = request_body_metadata(header)?;
+
+                if has_transfer_encoding {
+                    return Err(RequestReadError::NotImplemented);
+                }
+
+                if content_length > MAX_HTTP_BODY_SIZE {
+                    return Err(RequestReadError::BodyTooLarge);
+                }
+
+                let total_length = end + HTTP_HEADER_END.len() + content_length;
+                headers_complete = true;
+                expected_length = Some(total_length);
+            } else if request.len() > MAX_HTTP_HEADER_SIZE {
+                return Err(RequestReadError::HeaderTooLarge);
+            }
+        }
+
+        // Return exactly one request. Extra pipelined bytes are ignored because
+        // Blank sends Connection: close for every response.
+        if let Some(total_length) = expected_length
+            && request.len() >= total_length
+        {
+            request.truncate(total_length);
+            return Ok(Some(request));
         }
     }
 }
 
-/// Writes all response bytes to a non-blocking client stream.
-async fn write_all_async(client: &mut TcpStream, content: &[u8]) -> io::Result<()> {
-    // Keep track of how much data has already been written.
+/// Writes the complete response before one absolute write deadline.
+fn write_all_timeout(client: &mut TcpStream, content: &[u8]) -> io::Result<()> {
+    let started = Instant::now();
+    let timeout = Duration::from_millis(HTTP_WRITE_TIMEOUT_MS);
     let mut written = 0;
 
-    // Do not let a client that never reads hold a task forever.
-    let started = Instant::now();
-
     while written < content.len() {
-        // Try to write the remaining bytes.
-        let bytes_written = poll_fn(|_context| {
-            if started.elapsed() >= Duration::from_millis(HTTP_WRITE_TIMEOUT_MS) {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "HTTP response write timed out",
-                )));
-            }
+        let remaining = timeout
+            .checked_sub(started.elapsed())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
 
-            match client.write(&content[written..]) {
-                Ok(0) => Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "failed to write HTTP response",
-                ))),
-                Ok(bytes_written) => Poll::Ready(Ok(bytes_written)),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => Poll::Pending,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => Poll::Pending,
-                Err(error) => Poll::Ready(Err(error)),
-            }
-        })
-        .await?;
+        client.set_write_timeout(Some(remaining))?;
 
-        written += bytes_written;
+        match client.write(&content[written..]) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+            Ok(bytes_written) => written += bytes_written,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
     }
 
     Ok(())
 }
 
-/// A parsed HTTP request containing its method, route, version,
-/// and headers.
-struct ParsedRequest {
-    method: String,
-    route: String,
-    version: String,
-    headers: BlankReq,
+/// Reads Content-Length and Transfer-Encoding from a raw header block.
+fn request_body_metadata(header: &[u8]) -> Result<(usize, bool), RequestReadError> {
+    let header_text = std::str::from_utf8(header).map_err(|_| RequestReadError::BadRequest)?;
+    let mut content_length = None;
+    let mut has_transfer_encoding = false;
+
+    for line in header_text.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(RequestReadError::BadRequest);
+        };
+
+        let name = name.trim();
+        let value = value.trim();
+
+        if name.eq_ignore_ascii_case(HTTP_CONTENT_LENGTH_HEADER) {
+            if content_length.is_some() {
+                return Err(RequestReadError::BadRequest);
+            }
+
+            content_length = Some(
+                value
+                    .parse::<usize>()
+                    .map_err(|_| RequestReadError::BadRequest)?,
+            );
+        }
+
+        if name.eq_ignore_ascii_case(HTTP_TRANSFER_ENCODING_HEADER) && !value.is_empty() {
+            has_transfer_encoding = true;
+        }
+    }
+
+    Ok((content_length.unwrap_or(0), has_transfer_encoding))
 }
 
-/// Parses an HTTP request header block.
+/// Finds the first occurrence of a byte sequence.
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// A parsed HTTP request containing the complete request data.
+struct ParsedRequest {
+    request: BlankReq,
+}
+
+/// Parses an HTTP request header block and its body.
 fn parse_http_request(request: &[u8]) -> Result<ParsedRequest, &'static str> {
     // Find the end of the HTTP headers.
-    let Some(header_end) = request
-        .windows(HTTP_HEADER_END.len())
-        .position(|window| window == HTTP_HEADER_END)
-    else {
+    let Some(header_end) = find_bytes(request, HTTP_HEADER_END) else {
         return Err(HTTP_BAD_REQUEST);
     };
 
     // Convert the header bytes into text.
-    let header_text = String::from_utf8_lossy(&request[..header_end]);
+    let header_text = std::str::from_utf8(&request[..header_end]).map_err(|_| HTTP_BAD_REQUEST)?;
 
     // Parse the request line and all following header lines.
     let mut lines = header_text.lines();
@@ -839,7 +1125,7 @@ fn parse_http_request(request: &[u8]) -> Result<ParsedRequest, &'static str> {
 
     let mut parts = line.split_whitespace();
 
-    let (Some(method), Some(route), Some(version)) = (parts.next(), parts.next(), parts.next())
+    let (Some(method), Some(target), Some(version)) = (parts.next(), parts.next(), parts.next())
     else {
         return Err(HTTP_BAD_REQUEST);
     };
@@ -865,12 +1151,12 @@ fn parse_http_request(request: &[u8]) -> Result<ParsedRequest, &'static str> {
     }
 
     // Routes must be origin-form paths beginning with a slash.
-    if !route.starts_with('/') {
+    if !target.starts_with('/') {
         return Err(HTTP_BAD_REQUEST);
     }
 
     // Store every request header, including repeated header names.
-    let mut headers: BlankReq = HashMap::new();
+    let mut headers: BlankHeaders = HashMap::new();
 
     for line in lines {
         // Ignore empty lines inside the parsed header section.
@@ -886,8 +1172,8 @@ fn parse_http_request(request: &[u8]) -> Result<ParsedRequest, &'static str> {
         let name = name.trim();
         let value = value.trim();
 
-        // Reject malformed header names.
-        if !is_valid_header_name(name) {
+        // Reject malformed header names and line breaks in values.
+        if !is_valid_header_name(name) || !is_valid_header_value(value) {
             return Err(HTTP_BAD_REQUEST);
         }
 
@@ -897,33 +1183,249 @@ fn parse_http_request(request: &[u8]) -> Result<ParsedRequest, &'static str> {
             .push(value.to_string());
     }
 
+    // The body length is checked again while parsing so this function
+    // remains safe when it is called independently in tests.
+    let (content_length, has_transfer_encoding) =
+        request_body_metadata(&request[..header_end]).map_err(|error| error.response().0)?;
+
+    if has_transfer_encoding {
+        return Err(HTTP_NOT_IMPLEMENTED);
+    }
+
+    if content_length > MAX_HTTP_BODY_SIZE {
+        return Err(HTTP_PAYLOAD_TOO_LARGE);
+    }
+
+    let body_start = header_end + HTTP_HEADER_END.len();
+    let body_end = body_start
+        .checked_add(content_length)
+        .ok_or(HTTP_BAD_REQUEST)?;
+
+    if request.len() < body_end {
+        return Err(HTTP_BAD_REQUEST);
+    }
+
+    let body = request[body_start..body_end].to_vec();
+
     // The query string is not part of the route registry key.
-    let route = route.split('?').next().unwrap_or(route).to_string();
+    let (path, query_string) = target.split_once('?').unwrap_or((target, ""));
+    let query = parse_urlencoded(query_string.as_bytes()).map_err(|_| HTTP_BAD_REQUEST)?;
+
+    // Forms are parsed according to the request's content type.
+    let mut forms = BlankForms::new();
+
+    if let Some(content_type) = headers
+        .get(HTTP_CONTENT_TYPE_HEADER)
+        .and_then(|values| values.first())
+    {
+        let media_type = content_type.split(';').next().unwrap_or("").trim();
+
+        if media_type.eq_ignore_ascii_case(CONTENT_TYPE_FORM_URLENCODED) {
+            forms = parse_urlencoded(&body).map_err(|_| HTTP_BAD_REQUEST)?;
+        } else if media_type.eq_ignore_ascii_case(CONTENT_TYPE_MULTIPART_FORM_DATA) {
+            forms = parse_multipart_form(&body, content_type).map_err(|_| HTTP_BAD_REQUEST)?;
+        }
+    }
 
     Ok(ParsedRequest {
-        method: method.to_string(),
-        route,
-        version: version.to_string(),
-        headers,
+        request: BlankReq {
+            method: method.to_string(),
+            route: path.to_string(),
+            version: version.to_string(),
+            headers,
+            body,
+            query,
+            forms,
+        },
     })
 }
 
-/// Runs one accepted client connection as a coroutine.
-async fn handle_connection(mut client: TcpStream, routes: Arc<HashMap<String, BlankView>>) {
-    // Read the HTTP request without blocking other tasks.
-    let request = match read_http_request(&mut client).await {
+/// Parses URL-encoded query or form data.
+fn parse_urlencoded(input: &[u8]) -> Result<BlankForms, ()> {
+    let mut values = BlankForms::new();
+
+    if input.is_empty() {
+        return Ok(values);
+    }
+
+    for pair in input.split(|byte| *byte == b'&') {
+        if pair.is_empty() {
+            continue;
+        }
+
+        let (name, value) = match pair.iter().position(|byte| *byte == b'=') {
+            Some(index) => (&pair[..index], &pair[index + 1..]),
+            None => (pair, &[][..]),
+        };
+
+        let name = url_decode(name).ok_or(())?;
+        let value = url_decode(value).ok_or(())?;
+        insert_form_value(&mut values, name, value)?;
+    }
+
+    Ok(values)
+}
+
+/// Decodes one application/x-www-form-urlencoded value.
+fn url_decode(input: &[u8]) -> Option<String> {
+    let mut decoded = Vec::with_capacity(input.len());
+    let mut index = 0;
+
+    while index < input.len() {
+        match input[index] {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            b'%' => {
+                let high = *input.get(index + 1)?;
+                let low = *input.get(index + 2)?;
+                decoded.push((hex_value(high)? << 4) | hex_value(low)?);
+                index += 3;
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+
+    String::from_utf8(decoded).ok()
+}
+
+/// Converts one hexadecimal byte into its numeric value.
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Adds one parsed field while enforcing the configured form limits.
+fn insert_form_value(forms: &mut BlankForms, name: String, value: String) -> Result<(), ()> {
+    if name.is_empty() || value.len() > MAX_FORM_FIELD_SIZE {
+        return Err(());
+    }
+
+    if !forms.contains_key(&name) && forms.len() >= MAX_FORM_FIELDS {
+        return Err(());
+    }
+
+    forms.entry(name).or_default().push(value);
+    Ok(())
+}
+
+/// Parses text fields from a multipart/form-data request body.
+///
+/// File parts are deliberately skipped in this first form implementation.
+fn parse_multipart_form(body: &[u8], content_type: &str) -> Result<BlankForms, ()> {
+    let boundary = content_type
+        .split(';')
+        .skip(1)
+        .find_map(|parameter| {
+            let (name, value) = parameter.trim().split_once('=')?;
+            if name
+                .trim()
+                .eq_ignore_ascii_case(MULTIPART_BOUNDARY_PARAMETER)
+            {
+                Some(value.trim().trim_matches('"').to_string())
+            } else {
+                None
+            }
+        })
+        .filter(|boundary| !boundary.is_empty())
+        .ok_or(())?;
+
+    let marker = format!("{}{}", MULTIPART_BOUNDARY_PREFIX, boundary).into_bytes();
+    let mut forms = BlankForms::new();
+    let mut cursor = 0;
+
+    loop {
+        let marker_start = find_bytes(&body[cursor..], &marker)
+            .map(|offset| cursor + offset)
+            .ok_or(())?;
+        let mut part_start = marker_start + marker.len();
+
+        // The final marker ends with two hyphens.
+        if body.get(part_start..part_start + MULTIPART_FINAL_MARKER.len())
+            == Some(MULTIPART_FINAL_MARKER)
+        {
+            break;
+        }
+
+        if body.get(part_start..part_start + HTTP_LINE_END.len()) != Some(HTTP_LINE_END) {
+            return Err(());
+        }
+
+        part_start += HTTP_LINE_END.len();
+
+        let next_marker = find_bytes(&body[part_start..], &marker)
+            .map(|offset| part_start + offset)
+            .ok_or(())?;
+
+        if next_marker < part_start + 2 {
+            return Err(());
+        }
+
+        // The CRLF immediately before the next boundary is not field content.
+        let part_end = next_marker - 2;
+        let part = &body[part_start..part_end];
+        let header_end = find_bytes(part, HTTP_HEADER_END).ok_or(())?;
+        let part_headers = std::str::from_utf8(&part[..header_end]).map_err(|_| ())?;
+        let disposition = part_headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case(HTTP_CONTENT_DISPOSITION_HEADER)
+                    .then_some(value.trim())
+            })
+            .ok_or(())?;
+
+        // File parts need a dedicated binary upload API, so they are skipped.
+        if !disposition_parameter_exists(disposition, MULTIPART_FILENAME_PARAMETER) {
+            let name = disposition_parameter(disposition, MULTIPART_NAME_PARAMETER).ok_or(())?;
+            let value = std::str::from_utf8(&part[header_end + HTTP_HEADER_END.len()..])
+                .map_err(|_| ())?
+                .to_string();
+            insert_form_value(&mut forms, name, value)?;
+        }
+
+        cursor = next_marker;
+    }
+
+    Ok(forms)
+}
+
+/// Returns a quoted or unquoted parameter from a Content-Disposition value.
+fn disposition_parameter(disposition: &str, key: &str) -> Option<String> {
+    disposition.split(';').skip(1).find_map(|parameter| {
+        let (name, value) = parameter.trim().split_once('=')?;
+        name.trim()
+            .eq_ignore_ascii_case(key)
+            .then(|| value.trim().trim_matches('"').to_string())
+    })
+}
+
+/// Checks whether a Content-Disposition parameter exists.
+fn disposition_parameter_exists(disposition: &str, key: &str) -> bool {
+    disposition_parameter(disposition, key).is_some()
+}
+
+/// Runs one accepted client connection on its own bounded worker thread.
+fn handle_connection(mut client: TcpStream, routes: Arc<HashMap<String, BlankView>>) {
+    // Let the operating system optimize small request/response exchanges.
+    let _ = client.set_nodelay(true);
+    let _ = client.set_read_timeout(Some(Duration::from_millis(HTTP_REQUEST_TIMEOUT_MS)));
+    let _ = client.set_write_timeout(Some(Duration::from_millis(HTTP_WRITE_TIMEOUT_MS)));
+
+    // Read the HTTP request without polling or holding the listener thread.
+    let request = match read_http_request(&mut client) {
         Ok(Some(request)) => request,
         Ok(None) => return,
         Err(error) => {
-            // A request that exceeds the header limit receives 431.
-            let (status, body) = match error.kind() {
-                io::ErrorKind::InvalidData => {
-                    (HTTP_HEADER_FIELDS_TOO_LARGE, "Request headers too large")
-                }
-                io::ErrorKind::TimedOut => (HTTP_REQUEST_TIMEOUT, "Request Timeout"),
-                _ => (HTTP_BAD_REQUEST, "Bad Request"),
-            };
-
+            let (status, body) = error.response();
             let response = http_return!(
                 status,
                 body.as_bytes(),
@@ -931,7 +1433,8 @@ async fn handle_connection(mut client: TcpStream, routes: Arc<HashMap<String, Bl
                 &HashMap::<String, Vec<String>>::new()
             );
 
-            let _ = write_all_async(&mut client, &response).await;
+            let _ = write_all_timeout(&mut client, &response);
+            let _ = client.shutdown(Shutdown::Both);
             return;
         }
     };
@@ -939,20 +1442,16 @@ async fn handle_connection(mut client: TcpStream, routes: Arc<HashMap<String, Bl
     // Parse the request into Blank's request representation.
     let response = match parse_http_request(&request) {
         Ok(request) => {
-            // Keep method and version available for future BlankReq fields.
-            let _method = request.method;
-            let _version = request.version;
-
             // Create an output object for the selected view.
             let mut out = BlankRes::new();
 
             // Find the view registered for this route.
-            if let Some(view) = routes.get(&request.route) {
-                // Run the view with the request headers and mutable response.
-                view(&request.headers, &mut out);
+            if let Some(view) = routes.get(&request.request.route) {
+                // Run the view with the complete request and mutable response.
+                view(&request.request, &mut out);
             } else {
                 // The requested route does not exist.
-                out.status(HTTP_NOT_FOUND).text("Not Found");
+                out.status(HTTP_NOT_FOUND).text(BODY_NOT_FOUND);
             }
 
             // Convert the response builder into a valid HTTP response.
@@ -966,12 +1465,12 @@ async fn handle_connection(mut client: TcpStream, routes: Arc<HashMap<String, Bl
         Err(status) => {
             // Keep error bodies short and readable for now.
             let body = match status {
-                HTTP_BAD_REQUEST => "Bad Request",
-                HTTP_VERSION_NOT_SUPPORTED => "HTTP Version Not Supported",
-                HTTP_NOT_IMPLEMENTED => "Not Implemented",
-                HTTP_METHOD_NOT_ALLOWED => "Method Not Allowed",
-                HTTP_REQUEST_TIMEOUT => "Request Timeout",
-                _ => "Request Error",
+                HTTP_BAD_REQUEST => BODY_BAD_REQUEST,
+                HTTP_VERSION_NOT_SUPPORTED => BODY_HTTP_VERSION_NOT_SUPPORTED,
+                HTTP_NOT_IMPLEMENTED => BODY_NOT_IMPLEMENTED,
+                HTTP_METHOD_NOT_ALLOWED => BODY_METHOD_NOT_ALLOWED,
+                HTTP_PAYLOAD_TOO_LARGE => BODY_CONTENT_TOO_LARGE,
+                _ => BODY_REQUEST_ERROR,
             };
 
             http_return!(
@@ -983,8 +1482,9 @@ async fn handle_connection(mut client: TcpStream, routes: Arc<HashMap<String, Bl
         }
     };
 
-    // Send the response. A failed client write simply ends this task.
-    let _ = write_all_async(&mut client, &response).await;
+    // Send the response. A failed client write simply ends this worker.
+    let _ = write_all_timeout(&mut client, &response);
+    let _ = client.shutdown(Shutdown::Both);
 }
 
 /// from Port or u16.
