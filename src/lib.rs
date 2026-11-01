@@ -16,7 +16,7 @@
 //! ```
 
 // mod all files
-mod constants;
+pub mod constants;
 mod server;
 
 // use compile-only on tests.rs
@@ -26,7 +26,7 @@ mod server;
 mod tests;
 
 // make module contents publicly available
-pub use server::Blank;
+pub use server::{Blank, BlankReq, BlankHeaders, BlankView};
 
 use constants::HELLO_MESSAGE;
 
