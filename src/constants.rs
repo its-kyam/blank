@@ -82,7 +82,7 @@ pub(crate) const CLIENT_THREAD_NAME: &str = "blank-client";
 ///
 /// The unit is milliseconds, represented as a `u64` so it can be used with duration and
 /// timeout APIs that accept an integer millisecond count.
-pub(crate) const SERVER_WAKE_TIMEOUT_MS: u64 = 100;
+pub const SERVER_WAKE_TIMEOUT_MS: u64 = 100;
 
 // HTTP request handling
 
@@ -103,7 +103,7 @@ pub const HTTP_BUFFER: [u8; 1024] = [0u8; 1024];
 /// The configured limit is `16 * 1024` bytes, or 16 KiB. It bounds the amount of header data
 /// the request parser is willing to accept, helping prevent a client from making the server
 /// accumulate an unbounded header section. The value is measured in bytes, not characters;
-/// multi-byte text encodings therefore consume more than one byte per character.
+/// multibyte text encodings therefore consume more than one byte per character.
 ///
 /// This limit applies to request headers, not to the request body. Body size is governed
 /// separately by [`MAX_HTTP_BODY_SIZE`]. The value is a parser limit and should not be
