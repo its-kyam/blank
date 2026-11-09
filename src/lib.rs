@@ -177,7 +177,7 @@ pub mod server;
 mod tests;
 
 // make module contents publicly available
-pub use server::{Blank, BlankHeaders, BlankReq, BlankRes, BlankServer, BlankView, Port, Host};
+pub use server::{Blank, BlankHeaders, BlankReq, BlankRes, BlankServer, BlankView, Host, Port};
 
 use constants::HELLO_MESSAGE;
 
