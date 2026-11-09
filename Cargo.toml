@@ -4,7 +4,7 @@ description = "A lightning-fast web framework where DX is as important as UX, Se
 repository = "https://github.com/its-kyam/blank"
 license = "MIT OR Apache-2.0"
 authors = ["Kushaal Bandi <koolcoolkoolcoolkoolkool@gmail.com"]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 
 [dependencies]
