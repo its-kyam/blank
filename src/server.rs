@@ -78,9 +78,11 @@
 //!
 
 use crate::constants::{
-    BODY_BAD_REQUEST, BODY_CONTENT_TOO_LARGE, BODY_HTTP_VERSION_NOT_SUPPORTED,
+    BODY_BAD_GATEWAY, BODY_BAD_REQUEST, BODY_CONTENT_TOO_LARGE, BODY_FORBIDDEN,
+    BODY_GATEWAY_TIMEOUT, BODY_HTTP_VERSION_NOT_SUPPORTED, BODY_INTERNAL_SERVER_ERROR,
     BODY_METHOD_NOT_ALLOWED, BODY_NOT_FOUND, BODY_NOT_IMPLEMENTED, BODY_REQUEST_ERROR,
-    BODY_REQUEST_HEADERS_TOO_LARGE, BODY_REQUEST_TIMEOUT, BODY_SERVICE_UNAVAILABLE, BODY_TRANSFER_ENCODING_NOT_SUPPORTED, BlankError,
+    BODY_REQUEST_HEADERS_TOO_LARGE, BODY_REQUEST_TIMEOUT, BODY_SERVICE_UNAVAILABLE,
+    BODY_TOO_MANY_REQUESTS, BODY_TRANSFER_ENCODING_NOT_SUPPORTED, BODY_UNAUTHORIZED, BlankError,
     CLIENT_THREAD_NAME, CONTENT_TYPE_FORM_URLENCODED, CONTENT_TYPE_HTML, CONTENT_TYPE_JSON,
     CONTENT_TYPE_MULTIPART_FORM_DATA, CONTENT_TYPE_OCTET_STREAM, CONTENT_TYPE_TEXT,
     COOKIE_CLEAR_ATTRIBUTES, COOKIE_DEFAULT_ATTRIBUTES, DEFAULT_PORT, ERROR_ACCEPT_CONNECTION,
@@ -1381,11 +1383,11 @@ impl BlankRes {
         self.status(HTTP_NO_CONTENT).text("")
     }
 
-    /// Sets the response status to `400 Bad Request` without changing the body or headers.
+    /// Sets `400 Bad Request` and the framework's standard bad-request text body.
     ///
     /// Use this when the handler cannot process the request because its application-level
-    /// input is invalid. The method only sets the status; call a body method such as
-    /// `json`, `text`, or `html` after it to send a custom error body.
+    /// input is invalid. This helper replaces the current body with the predefined
+    /// error text but preserves additional headers that were already added.
     ///
     /// # Examples
     ///
@@ -1401,14 +1403,15 @@ impl BlankRes {
     /// response.header("X-Validation", "failed").bad_request();
     /// ```
     pub fn bad_request(&mut self) -> &mut Self {
-        self.status(HTTP_BAD_REQUEST)
+        self.status(HTTP_BAD_REQUEST).text(BODY_BAD_REQUEST)
     }
 
-    /// Sets the response status to `401 Unauthorized` without changing the body or headers.
+    /// Sets `401 Unauthorized` and the framework's standard unauthorized text body.
     ///
-    /// This method only sets the status. It does not implement authentication, validate
-    /// credentials, or automatically add a `WWW-Authenticate` challenge. Add headers
-    /// explicitly and call a body method to supply a custom response body.
+    /// This helper selects the status and predefined body only. It does not implement
+    /// authentication, validate credentials, or automatically add a `WWW-Authenticate`
+    /// challenge. If an application requires additional authentication headers, add
+    /// them explicitly with a response header method.
     ///
     /// # Examples
     ///
@@ -1424,14 +1427,15 @@ impl BlankRes {
     /// response.header("WWW-Authenticate", "Bearer").unauthorized();
     /// ```
     pub fn unauthorized(&mut self) -> &mut Self {
-        self.status(HTTP_UNAUTHORIZED)
+        self.status(HTTP_UNAUTHORIZED).text(BODY_UNAUTHORIZED)
     }
 
-    /// Sets the response status to `403 Forbidden` without changing the body or headers.
+    /// Sets `403 Forbidden` and the framework's standard forbidden text body.
     ///
     /// Use this when the request is understood but the application will not permit the
-    /// requested operation. The method only sets the status; the view is responsible
-    /// for providing a body with `json`, `text`, or `html`.
+    /// requested operation. The helper does not perform authorization checks; the view
+    /// must make that decision before calling it. Existing additional headers are
+    /// retained while the body is replaced.
     ///
     /// # Examples
     ///
@@ -1447,14 +1451,15 @@ impl BlankRes {
     /// response.header("X-Access", "denied").forbidden();
     /// ```
     pub fn forbidden(&mut self) -> &mut Self {
-        self.status(HTTP_FORBIDDEN)
+        self.status(HTTP_FORBIDDEN).text(BODY_FORBIDDEN)
     }
 
-    /// Sets the response status to `404 Not Found` without changing the body or headers.
+    /// Sets `404 Not Found` and the framework's standard not-found text body.
     ///
     /// Use this when the requested application resource or route is not available. A
     /// missing registered route is also handled by the server internally with this
-    /// status. The method only sets the status; call a body method to supply the response.
+    /// status, but a view may use the helper when a route exists and a more specific
+    /// resource does not. The helper replaces the body and retains other headers.
     ///
     /// # Examples
     ///
@@ -1470,14 +1475,15 @@ impl BlankRes {
     /// response.header("X-Resource", "missing").not_found();
     /// ```
     pub fn not_found(&mut self) -> &mut Self {
-        self.status(HTTP_NOT_FOUND)
+        self.status(HTTP_NOT_FOUND).text(BODY_NOT_FOUND)
     }
 
-    /// Sets the response status to `405 Method Not Allowed` without changing the body or headers.
+    /// Sets `405 Method Not Allowed` and the framework's standard error body.
     ///
     /// This helper is for a request method that is not permitted for the selected
     /// resource. It does not automatically add an `Allow` header; add one explicitly if
-    /// the application wants to advertise accepted methods. The method only sets the status.
+    /// the application wants to advertise accepted methods. The method replaces the
+    /// body while preserving the other response headers.
     ///
     /// # Examples
     ///
@@ -1494,6 +1500,7 @@ impl BlankRes {
     /// ```
     pub fn method_not_allowed(&mut self) -> &mut Self {
         self.status(HTTP_METHOD_NOT_ALLOWED)
+            .text(BODY_METHOD_NOT_ALLOWED)
     }
 
     /// Sets `408 Request Timeout` and the framework's standard timeout text body.
@@ -1517,14 +1524,15 @@ impl BlankRes {
     /// response.header("X-Timeout-Source", "application").request_timeout();
     /// ```
     pub fn request_timeout(&mut self) -> &mut Self {
-        self.status(HTTP_REQUEST_TIMEOUT)
+        self.status(HTTP_REQUEST_TIMEOUT).text(BODY_REQUEST_TIMEOUT)
     }
 
-    /// Sets the response status to `500 Internal Server Error` without changing the body or headers.
+    /// Sets `500 Internal Server Error` and the framework's standard error body.
     ///
     /// Use this when the handler cannot complete an otherwise valid request because of
-    /// an unexpected application-side failure. The method only sets the status; call a
-    /// body method such as `json` or `text` to send a custom error body.
+    /// an unexpected application-side failure. The helper does not log the failure or
+    /// expose an error object; applications should record diagnostic details separately
+    /// and avoid returning sensitive internal information to clients.
     ///
     /// # Examples
     ///
@@ -1541,6 +1549,7 @@ impl BlankRes {
     /// ```
     pub fn internal_server_error(&mut self) -> &mut Self {
         self.status(HTTP_INTERNAL_SERVER_ERROR)
+            .text(BODY_INTERNAL_SERVER_ERROR)
     }
 
     /// Configures a `301 Moved Permanently` redirect to `location`.
@@ -1601,6 +1610,7 @@ impl BlankRes {
     /// ```
     pub fn payload_too_large(&mut self) -> &mut Self {
         self.status(HTTP_PAYLOAD_TOO_LARGE)
+            .text(BODY_CONTENT_TOO_LARGE)
     }
 
     /// Sets `429 Too Many Requests` and the framework's standard body.
@@ -1625,6 +1635,7 @@ impl BlankRes {
     /// ```
     pub fn too_many_requests(&mut self) -> &mut Self {
         self.status(HTTP_TOO_MANY_REQUESTS)
+            .text(BODY_TOO_MANY_REQUESTS)
     }
 
     /// Sets `502 Bad Gateway` and the framework's standard body.
@@ -1647,7 +1658,7 @@ impl BlankRes {
     /// response.header("X-Upstream", "unavailable").bad_gateway();
     /// ```
     pub fn bad_gateway(&mut self) -> &mut Self {
-        self.status(HTTP_BAD_GATEWAY)
+        self.status(HTTP_BAD_GATEWAY).text(BODY_BAD_GATEWAY)
     }
 
     /// Sets `504 Gateway Timeout` and the framework's standard body.
@@ -1671,7 +1682,7 @@ impl BlankRes {
     /// response.header("X-Upstream-Timeout", "true").gateway_timeout();
     /// ```
     pub fn gateway_timeout(&mut self) -> &mut Self {
-        self.status(HTTP_GATEWAY_TIMEOUT)
+        self.status(HTTP_GATEWAY_TIMEOUT).text(BODY_GATEWAY_TIMEOUT)
     }
 
     /// Sets `503 Service Unavailable` and the framework's standard body.
@@ -1695,6 +1706,7 @@ impl BlankRes {
     /// ```
     pub fn service_unavailable(&mut self) -> &mut Self {
         self.status(HTTP_SERVICE_UNAVAILABLE)
+            .text(BODY_SERVICE_UNAVAILABLE)
     }
 
     /// Overrides the media type written for the current response body.
